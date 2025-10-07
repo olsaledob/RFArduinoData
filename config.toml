@@ -1,0 +1,16 @@
+[st_calculation]
+start = -5
+end = 3
+
+[st_plotting]
+top_n = 3
+plot_folder = "plots"
+[noise_parameters]
+noise_min = 0
+noise_max = 10
+n_noise = 10
+
+[unit_processor]
+dt = 0.0625
+save_plots = true
+plot_folder = "plots"
