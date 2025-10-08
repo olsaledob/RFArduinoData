@@ -10,7 +10,30 @@ if module_path not in sys.path:
     sys.path.append(module_path)
 
 from receptive_field_analysis import RFAnalysis
-
+    
+def rescale_to_dt(stimulus, spike_times, old_dt, new_dt, total_duration=None):
+        H, W, T = stimulus.shape
+        if total_duration is None:
+            total_duration = T * old_dt
+    
+        T_new = int(np.round(total_duration / new_dt))
+        # new time edges
+        bin_edges = np.linspace(0, total_duration, T_new + 1)
+    
+        # resample stimulus
+        stim_rescaled = np.zeros((H, W, T_new), dtype=stimulus.dtype)
+        old_time_centers = np.arange(T) * old_dt + old_dt / 2
+    
+        # nearest neighbor assignment (fast option)
+        for i_new, t_center in enumerate((bin_edges[:-1] + bin_edges[1:]) / 2):
+            # find nearest old frame
+            idx_old = int(np.clip(np.round(t_center / old_dt), 0, T-1))
+            stim_rescaled[:, :, i_new] = stimulus[:, :, idx_old]
+    
+        # --- bin spikes into new spike train ---
+        spike_train_rescaled, _ = np.histogram(spike_times, bins=bin_edges)
+    
+        return stim_rescaled, spike_train_rescaled, bin_edges
 
 class UnitProcessor:
     def __init__(self, data_dict, led_data, rec_id=None, config_file='config.toml', verbose=False):
@@ -39,21 +62,23 @@ class UnitProcessor:
         # Detect multiple stimulation blocks
         self.stim_blocks = self.detect_stim_blocks()
         self.valid_timestamps = self.flatten_stim_timestamps()
-        self.bin_edges = np.concatenate([self.valid_timestamps, [self.valid_timestamps[-1] + self.dt]])
+        # self.bin_edges = np.concatenate([self.valid_timestamps, [self.valid_timestamps[-1] + self.dt]])
+        self.bin_edges = np.arange(self.valid_timestamps[0], self.valid_timestamps[-1] + self.dt, self.dt)
         
         self.stimulus = None
         self.process_stimulus()
-
+        
     def detect_stim_blocks(self):
         """Detect non-contiguous blocks of stimulation."""
         dt = self.dt
         ts = self.led_timestamps
-        gap_indices = np.where(np.diff(ts) > dt * 1.5)[0]
+        gap_indices = np.where(np.diff(ts) > 0.1)[0]
         start_indices = np.insert(gap_indices + 1, 0, 0)
         end_indices = np.append(gap_indices, len(ts) - 1)
         blocks = [(ts[start], ts[end] + dt) for start, end in zip(start_indices, end_indices)]
+        # self.logger.info(f'Blocks at {blocks}')
         return blocks
-
+    
     def flatten_stim_timestamps(self):
         """Merge all timestamps from separate stim blocks into one array."""
         ts = []
@@ -70,15 +95,33 @@ class UnitProcessor:
         # Extract stimulus frames for valid timestamps only
         ts_mask = np.isin(self.led_timestamps, self.valid_timestamps)
         stimulus = self.patterns[ts_mask]
-
+        n_bins = len(self.bin_edges) - 1
+        
         stimulus = np.unpackbits(stimulus.astype(np.uint8), axis=1)
         stimulus = stimulus.reshape(stimulus.shape[0], 16, 16)
         stimulus = stimulus.transpose((1, 2, 0))  # shape (16, 16, N)
 
         stimulus_left_half = np.flip(stimulus[:, 0:8, :], axis=1)
         stimulus_right_half = np.flip(stimulus[:, 8:16, :], axis=1)
-        self.stimulus = np.hstack((stimulus_left_half, stimulus_right_half))
+        stimulus_frames = np.hstack((stimulus_left_half, stimulus_right_half))
 
+        led_times_valid = self.valid_timestamps
+
+        # Allocate uniform stimulus array
+        stim_uniform = np.zeros((stimulus_frames.shape[0], stimulus_frames.shape[1], n_bins),
+                                dtype=stimulus_frames.dtype)
+
+        # Fill each bin with the last LED frame active at bin start
+        for i in range(n_bins):
+            t_bin = self.bin_edges[i]
+            frame_idx = np.searchsorted(led_times_valid, t_bin, side='right') - 1
+            if frame_idx < 0:
+                frame_idx = 0
+            stim_uniform[:, :, i] = stimulus_frames[:, :, frame_idx]
+
+        # Set final uniform stimulus
+        self.stimulus = stim_uniform
+        
     def process_all_units(self):
         self.logger.info("Processing all units\n")
         for key in self.data_dict.keys():
@@ -127,11 +170,12 @@ class UnitProcessor:
 
         # STA/RTA analysis — ONLY stim periods
         spike_train = np.histogram(spikes_in_stim, bins=self.bin_edges)[0]
+        self.logger.info(spike_train)
         filter_empty = np.zeros((16, 16))
         analysis = RFAnalysis(self.stimulus, spike_train, filter_empty, 'CL')
         analysis.calc_sta(center=True)
         analysis.calc_rta(center=True)
-        analysis.plot_sta_lags(f'Rec-ID_{self.rec_id}_{key}', save=self.save_plots)
+        analysis.plot_sta_lags(f'Rec-ID_{self.rec_id}_{key}', show_filter = False, save=self.save_plots)
 
         # Plotting stim vs spikes
         plt.figure(figsize=(8, 3))
